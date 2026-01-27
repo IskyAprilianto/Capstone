@@ -1,171 +1,140 @@
 import streamlit as st
-import pymongo
 import pandas as pd
+import requests
 import time
 import paho.mqtt.client as mqtt
 import ssl
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
-# ================= HALAMAN =================
-st.set_page_config(
-    page_title="Hydroponic Monitoring",
-    page_icon="🌿",
-    layout="wide"
-)
+# ================= KONFIGURASI =================
+BACKEND_URL = "https://240d6c5a-085e-4090-9e99-77c9e41ddc06-00-1p1eomiap7bc6.picard.replit.dev/api/get_ph?device_id=68FE7181895C"
 
-# ================= KONFIGURASI DATABASE =================
-# Pastikan URI ini benar sesuai MongoDB Atlas Anda
-MONGO_URI = "mongodb+srv://Hydroponic:Hydro1234@hydroponic.exth76i.mongodb.net/?appName=Hydroponic"
-
-@st.cache_resource
-def init_db():
-    return pymongo.MongoClient(MONGO_URI)
-
-try:
-    client_db = init_db()
-    db = client_db["db_iot_proyek"]
-    collection = db["sensor_data"]
-except Exception as e:
-    st.error(f"Gagal konek Database: {e}")
-
-# ================= KONFIGURASI MQTT (HIVEMQ CLOUD) =================
-# Kita pakai HiveMQ agar bisa jalan di Streamlit Cloud
-MQTT_BROKER = "86d65c85d9bb491caaff9aeda3828bf1.s1.eu.hivemq.cloud"
+MQTT_BROKER = "3f8165ca59d840d9bc964c540d1b792e.s1.eu.hivemq.cloud"
 MQTT_PORT   = 8883
 MQTT_USER   = "Hydroponic"
 MQTT_PASS   = "Hydro1234"
-MQTT_TOPIC_STATUS = "iot/status/pompa"
 
-# Session State untuk Status Pompa (Biar UI tidak flicker)
+# ================= PAGE =================
+st.set_page_config(
+    page_title="Hydroponic Monitoring",
+    layout="wide"
+)
+
+st.title("🌱 Monitoring Hidroponik (Multi Device)")
+
+# ================= MQTT =================
 if "pump_status" not in st.session_state:
-    st.session_state["pump_status"] = "OFF"
+    st.session_state["pump_status"] = "UNKNOWN"
 
-def on_connect(client, userdata, flags, reason_code, properties):
-    if reason_code == 0:
-        client.subscribe(MQTT_TOPIC_STATUS)
+def on_connect(client, userdata, flags, rc, props):
+    if rc == 0:
+        client.subscribe("iot/status/pompa/+")
 
 def on_message(client, userdata, msg):
-    try:
-        st.session_state["pump_status"] = msg.payload.decode()
-    except:
-        pass
+    st.session_state["pump_status"] = msg.payload.decode()
 
 @st.cache_resource
 def init_mqtt():
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-    client.username_pw_set(MQTT_USER, MQTT_PASS)
-    
-    # Setting SSL Wajib buat HiveMQ Cloud
-    client.tls_set(cert_reqs=ssl.CERT_NONE)
-    client.tls_insecure_set(True)
-    
-    client.on_connect = on_connect
-    client.on_message = on_message
-    
-    try:
-        client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        client.loop_start()
-    except Exception as e:
-        st.error(f"Gagal konek MQTT: {e}")
-    return client
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    c.username_pw_set(MQTT_USER, MQTT_PASS)
+    c.tls_set(cert_reqs=ssl.CERT_NONE)
+    c.tls_insecure_set(True)
+    c.on_connect = on_connect
+    c.on_message = on_message
+    c.connect(MQTT_BROKER, MQTT_PORT, 60)
+    c.loop_start()
+    return c
 
 mqtt_client = init_mqtt()
 
-# ================= UTILS: KONVERSI WIB =================
-def convert_to_wib(df):
-    # Pastikan format timestamp dikenali sebagai datetime
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    
-    # Jika belum ada timezone (naive), anggap UTC dulu
-    if df["timestamp"].dt.tz is None:
-        df["timestamp"] = df["timestamp"].dt.tz_localize("UTC")
-    
-    # Convert ke Asia/Jakarta
-    df["timestamp"] = df["timestamp"].dt.tz_convert("Asia/Jakarta")
-    return df
+# ================= API HELPERS =================
+def api_get_devices():
+    r = requests.get(f"{BACKEND_URL}/api/get_devices", timeout=5)
+    return r.json().get("devices", [])
 
-def get_status_ph(ph):
-    if ph < 5.5:
-        return "ASAM", "error" # Merah
-    elif ph > 7.5:
-        return "BASA", "error" # Merah
-    else:
-        return "NORMAL", "success" # Hijau
+def api_get_last(device_id):
+    r = requests.get(
+        f"{BACKEND_URL}/api/get_last_data",
+        params={"device_id": device_id},
+        timeout=5
+    )
+    return r.json()
 
-# ================= SIDEBAR (MONITORING ONLY) =================
-st.sidebar.title("🌿 Dashboard")
-st.sidebar.markdown("Monitoring Hidroponik Real-time")
+def api_get_ph(device_id, limit=50):
+    r = requests.get(
+        f"{BACKEND_URL}/api/get_ph",
+        params={"device_id": device_id, "limit": limit},
+        timeout=5
+    )
+    return r.json().get("data", [])
+
+# ================= SIDEBAR =================
+st.sidebar.title("⚙️ Kontrol")
+
+devices = api_get_devices()
+if not devices:
+    st.sidebar.warning("Belum ada device")
+    st.stop()
+
+device_id = st.sidebar.selectbox("Pilih Device", devices)
+
+# ====== TOMBOL POMPA ======
+if st.sidebar.button("🟢 ON Pompa"):
+    mqtt_client.publish(f"iot/actuator/pompa/{device_id}", "ON")
+    st.sidebar.success("Perintah ON dikirim")
+
+if st.sidebar.button("🔴 OFF Pompa"):
+    mqtt_client.publish(f"iot/actuator/pompa/{device_id}", "OFF")
+    st.sidebar.success("Perintah OFF dikirim")
 
 st.sidebar.divider()
 
-# Status Pompa (Hanya Menampilkan, Tidak Mengontrol)
-st.sidebar.subheader("Status Pompa")
-status_pompa = st.session_state["pump_status"]
-
-if status_pompa == "ON":
-    st.sidebar.success("🟢 MENYALA")
-elif status_pompa == "MIXING":
-    st.sidebar.warning("⏳ MIXING (JEDA)")
-elif status_pompa == "WAIT_MIXING":
-    st.sidebar.warning("⛔ MENUNGGU")
+# ====== STATUS POMPA ======
+status = st.session_state["pump_status"]
+if status == "ON":
+    st.sidebar.success("Pompa: ON")
+elif status == "MIXING":
+    st.sidebar.warning("Pompa: MIXING")
+elif status == "OFF":
+    st.sidebar.info("Pompa: OFF")
 else:
-    st.sidebar.info("⚪ MATI")
+    st.sidebar.warning("Status: UNKNOWN")
 
-st.sidebar.divider()
-st.sidebar.caption("Terhubung ke HiveMQ & MongoDB Atlas")
+# ================= MAIN =================
 
-# ================= UI UTAMA =================
-st.title("🇮🇩 Monitoring Kualitas Air (WIB)")
+# ====== DATA TERAKHIR ======
+last = api_get_last(device_id)
 
-# 1. AMBIL DATA TERAKHIR DARI MONGODB
-try:
-    latest = list(collection.find().sort("timestamp", -1).limit(1))
+if "ph" in last:
+    c1, c2, c3 = st.columns(3)
+    c1.metric("pH Terbaru", f"{last['ph']:.2f}")
+    c2.metric("Pompa", last.get("pompa", "UNKNOWN"))
+    c3.metric("Waktu", last.get("timestamp", "-"))
+else:
+    st.warning("Data terakhir belum tersedia")
 
-    if latest:
-        data = latest[0]
-        ph = data.get("ph", 0)
-        
-        # Konversi Waktu Single Data
-        ts = data["timestamp"]
-        if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
-        ts = ts.astimezone(timezone(timedelta(hours=7))) # WIB
+st.divider()
 
-        status_text, color_code = get_status_ph(ph)
+# ====== GRAFIK HISTORIS ======
+st.subheader("📈 Grafik pH (50 Data Terakhir)")
+hist = api_get_ph(device_id, limit=50)
 
-        # Tampilkan Metrics (Kartu Atas)
-        col1, col2, col3 = st.columns(3)
-        col1.metric("pH Air Saat Ini", f"{ph:.2f}")
-        getattr(col2, color_code)(f"Kondisi: {status_text}")
-        col3.metric("Terakhir Update", ts.strftime("%H:%M:%S WIB"))
+if hist:
+    df = pd.DataFrame(hist)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    st.line_chart(df.sort_values("timestamp"), x="timestamp", y="ph")
+else:
+    st.info("Belum ada data historis")
 
-        st.divider()
+st.divider()
 
-        # 2. AMBIL DATA HISTORI UNTUK GRAFIK (50 Data Terakhir)
-        cursor = collection.find().sort("timestamp", -1).limit(50)
-        df = pd.DataFrame(list(cursor))
-
-        if not df.empty:
-            # Hapus _id biar bersih
-            if "_id" in df.columns: del df["_id"]
-            
-            # Convert waktu ke WIB
-            df = convert_to_wib(df)
-            
-            # Urutkan berdasarkan waktu (biar grafik jalan dari kiri ke kanan)
-            df = df.sort_values("timestamp")
-
-            st.subheader("📈 Grafik pH Air (Real-time)")
-            st.line_chart(df, x="timestamp", y="ph")
-
-            with st.expander("Lihat Data Tabel"):
-                st.dataframe(df.sort_values("timestamp", ascending=False)) # Tabel urut dari yang terbaru
-        
+# ====== TABEL DATA ======
+with st.expander("📄 Data Mentah"):
+    if hist:
+        st.dataframe(df.sort_values("timestamp", ascending=False))
     else:
-        st.info("Belum ada data masuk dari alat ESP32...")
+        st.write("Data kosong")
 
-except Exception as e:
-    st.error(f"Terjadi kesalahan saat mengambil data: {e}")
-
-# Auto Refresh setiap 3 detik tanpa tombol
-time.sleep(3)
+# ================= AUTO REFRESH =================
+time.sleep(5)
 st.rerun()
